@@ -1,4 +1,0 @@
-utils/county_coords.py
-Problem: the RMA data has county names and FIPS codes but no coordinates. We need lat/lon to call the weather API.
-
-Solution: Download the US Census Bureau's 2020 county population centroid file — a free 300 KB CSV with exact lat/lon for every US county. We build a fips key (state_fips + county_fips) that matches exactly what RMA uses (already zero-padded), then left-join it onto the yield dataframe. A hard-coded fallback covers the 12 biggest corn-belt counties in case the Census URL is unreachable in the demo environment.
