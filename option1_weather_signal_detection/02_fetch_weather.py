@@ -3,16 +3,21 @@
 #
 # Weather source priority (automatic fallback):
 #
-#   1. DATABRICKS MARKETPLACE — NOAA GSOD (best for Databricks)
+#   0. NOAA GHCN-Daily local files (BEST — no API, no rate limits)
+#      Download 16 files (~1.5 GB total) once and never worry about limits.
+#      Files: ghcnd-stations.txt + 2010.csv.gz … 2024.csv.gz
+#      Place in: option1_weather_signal_detection/data/ghcn/
+#      Set WEATHER_SOURCE="ghcn_local" or run with "auto" after downloading.
+#
+#   1. DATABRICKS MARKETPLACE — NOAA GSOD (best for Databricks without local files)
 #      No API calls. Already a Delta table in the workspace.
 #      Add from Marketplace: search "NOAA Global Surface Summary of Day"
 #
-#   2. NASA POWER API (best for local / when NOAA not available)
-#      Free, no rate limits, no API key. ~2-5s per request but 4 parallel
-#      workers. Specifically designed for agricultural meteorology.
+#   2. NASA POWER API (fallback when not on Databricks)
+#      Free, no API key. ~2-5s per request.
 #      URL: https://power.larc.nasa.gov/api/temporal/daily/point
 #
-#   3. Open-Meteo archive API (fallback)
+#   3. Open-Meteo archive API (last resort)
 #      Free, no key. Has a per-hour rate limit (~10k req/hour).
 #      Full disk cache + resume on re-run — hitting the limit just means
 #      re-running later to fetch the remainder.
@@ -44,11 +49,17 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 log = logger
 # ── Source selection ──────────────────────────────────────────────────────────
-# "auto"        : try NOAA GSOD → NASA POWER → Open-Meteo in that order
+# "auto"        : try GHCN local → NOAA GSOD → NASA POWER → Open-Meteo in that order
+# "ghcn_local"  : NOAA GHCN-Daily bulk files (best — no API, no rate limits)
+#                 Download files first:  check_ghcn_files(years) prints what to get
+#                 Place files in: option1_weather_signal_detection/data/ghcn/
 # "noaa_gsod"   : Databricks Marketplace NOAA data only
 # "nasa_power"  : NASA POWER API only (good default when not on Databricks)
 # "open_meteo"  : Open-Meteo archive API only
 WEATHER_SOURCE = "auto"
+
+# Directory for GHCN-Daily bulk files (relative to this notebook)
+GHCN_DIR = Path(__file__).parent / "data" / "ghcn"
 
 # COMMAND ----------
 # MAGIC %md
@@ -73,15 +84,56 @@ print(f"Years:    {years[0]} – {years[-1]}")
 print(f"Pairs:    {len(coords) * len(years):,}")
 print(f"Source:   {WEATHER_SOURCE}")
 
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 2. Source 1 — NOAA GSOD via Databricks Marketplace
-
-# COMMAND ----------
-
 weather_df = None
 
-if WEATHER_SOURCE in ("auto", "noaa_gsod") and spark is not None:
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 2. Source 0 — NOAA GHCN-Daily local files (no API, no rate limits)
+
+# COMMAND ----------
+
+if WEATHER_SOURCE in ("auto", "ghcn_local"):
+    from utils.local_weather_loader import build_weather_from_ghcn, check_ghcn_files
+
+    # Print a checklist so the user knows which files are present / missing
+    check_ghcn_files(years, GHCN_DIR)
+
+    ghcn_cache = str(Path(WEATHER_CACHE).with_name("weather_ghcn_cache.csv"))
+    log.info(
+        "Attempting NOAA GHCN-Daily from local files (dir: %s, cache: %s) …",
+        GHCN_DIR, ghcn_cache,
+    )
+
+    try:
+        weather_df = build_weather_from_ghcn(
+            coords,
+            years,
+            ghcn_dir=GHCN_DIR,
+            cache_path=ghcn_cache,
+        )
+        if weather_df is not None and not weather_df.empty:
+            log.info(
+                "GHCN-Daily: loaded %d (county, year) records — no API calls needed.",
+                len(weather_df),
+            )
+        else:
+            log.warning(
+                "GHCN-Daily returned no data. "
+                "Download the files listed above and re-run, "
+                "or proceed with API fallback."
+            )
+            weather_df = None
+    except Exception as exc:
+        log.warning("GHCN-Daily failed: %s — falling back to next source.", exc)
+        weather_df = None
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 3. Source 1 — NOAA GSOD via Databricks Marketplace
+
+# COMMAND ----------
+
+if weather_df is None and WEATHER_SOURCE in ("auto", "noaa_gsod") and spark is not None:
     try:
         from utils.databricks_weather import build_weather_from_gsod
 
@@ -106,7 +158,7 @@ if WEATHER_SOURCE in ("auto", "noaa_gsod") and spark is not None:
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 3. Source 2 — NASA POWER API (no rate limits, no key)
+# MAGIC ## 4. Source 2 — NASA POWER API (fallback)
 
 # COMMAND ----------
 
@@ -137,7 +189,7 @@ if weather_df is None and WEATHER_SOURCE in ("auto", "nasa_power"):
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 4. Source 3 — Open-Meteo archive API (cached, resumable)
+# MAGIC ## 5. Source 3 — Open-Meteo archive API (cached, resumable)
 
 # COMMAND ----------
 
@@ -212,10 +264,16 @@ if weather_df is None and WEATHER_SOURCE in ("auto", "open_meteo"):
 if weather_df is None or weather_df.empty:
     raise RuntimeError(
         "All weather data sources failed.\n"
-        "Options:\n"
-        "  1. Add NOAA GSOD from Databricks Marketplace and set WEATHER_SOURCE='noaa_gsod'\n"
-        "  2. Wait for Open-Meteo rate limit to reset (1 hour) and re-run — cache resumes\n"
-        "  3. Set WEATHER_SOURCE='nasa_power' to use the NASA API instead"
+        "Options (in recommended order):\n"
+        "  1. Download NOAA GHCN-Daily files (no API, no rate limits — BEST option):\n"
+        "       Run check_ghcn_files(years) to see exactly which files to download.\n"
+        "       Station metadata: https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt\n"
+        "       Yearly files:     https://www.ncei.noaa.gov/pub/data/ghcn/daily/by_year/YYYY.csv.gz\n"
+        "       Place in: option1_weather_signal_detection/data/ghcn/\n"
+        "       Then set WEATHER_SOURCE='ghcn_local' and re-run.\n"
+        "  2. On Databricks: add NOAA GSOD from Marketplace and set WEATHER_SOURCE='noaa_gsod'\n"
+        "  3. Wait for Open-Meteo rate limit to reset (1 hour) and re-run — cache resumes\n"
+        "  4. Set WEATHER_SOURCE='nasa_power' to use the NASA API instead"
     )
 
 print(f"\nWeather source used:    {weather_df.get('source', pd.Series(['unknown'])).mode()[0] if 'source' in weather_df.columns else 'see logs'}")
@@ -224,7 +282,7 @@ print(weather_df.head(3))
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 5. Quality checks & imputation
+# MAGIC ## 6. Quality checks & imputation
 
 # COMMAND ----------
 
@@ -245,7 +303,7 @@ for col in interp_cols:
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 6. Derived indices
+# MAGIC ## 7. Derived indices
 
 # COMMAND ----------
 
@@ -283,7 +341,7 @@ print(weather_df.describe().round(2))
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 7. Persist to Delta Lake
+# MAGIC ## 8. Persist to Delta Lake
 
 # COMMAND ----------
 
