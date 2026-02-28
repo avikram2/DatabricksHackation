@@ -40,8 +40,10 @@ warnings.filterwarnings("ignore")
 # MAGIC ## 1. Load and merge yield + weather
 
 # COMMAND ----------
-
-spark = get_spark()
+try:
+    spark = get_spark()
+except:
+    spark = None
 yield_df = read_delta(YIELD_DELTA, spark=spark)
 weather_df = read_delta(WEATHER_DELTA, spark=spark)
 
@@ -74,11 +76,13 @@ WEATHER_FEATURES = [
     "drought_days", "et0_total_mm", "solar_total_mj",
     "precip_z", "cwsi",
 ]
-WEATHER_FEATURES = [c for c in WEATHER_FEATURES if c in merged.columns]
+# Drop columns that are absent or entirely NaN (e.g. et0/solar not available from GHCN)
+WEATHER_FEATURES = [c for c in WEATHER_FEATURES if c in merged.columns and merged[c].notna().any()]
+print(f"Active weather features: {WEATHER_FEATURES}")
 
 corr_results = []
 for crop in CROPS:
-    subset = merged[merged["commodity_name"] == crop].dropna(subset=WEATHER_FEATURES + ["yield_bu_ac"])
+    subset = merged[merged["commodity_name"] == crop].dropna(subset=["yield_bu_ac"])
     for feat in WEATHER_FEATURES:
         vals = subset[["yield_bu_ac", feat]].dropna()
         if len(vals) < 20:
@@ -97,9 +101,16 @@ for crop in CROPS:
             }
         )
 
-corr_df = pd.DataFrame(corr_results).sort_values(["crop", "abs_pearson"], ascending=[True, False])
-print("\n=== Top correlations ===")
-print(corr_df.to_string(index=False))
+corr_df = pd.DataFrame(corr_results)
+if corr_df.empty:
+    print("WARNING: No correlations computed.")
+    print(f"  CROPS config   : {CROPS}")
+    print(f"  Crops in data  : {merged['commodity_name'].unique().tolist()}")
+    print(f"  Active features: {WEATHER_FEATURES}")
+else:
+    corr_df = corr_df.sort_values(["crop", "abs_pearson"], ascending=[True, False])
+    print("\n=== Top correlations ===")
+    print(corr_df.to_string(index=False))
 
 # COMMAND ----------
 # MAGIC %md
