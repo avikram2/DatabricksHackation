@@ -1,6 +1,6 @@
 # Databricks Hackathon — Crop Yield Intelligence Platform
 
-County-level Corn & Soybean yield analysis (2010-2024, 32 US states) built on Databricks + Open-Meteo weather APIs.
+County-level Corn & Soybean yield analysis (2010-2024, 32 US states) built on Databricks + NOAA weather APIs.
 
 ## Solution
 
