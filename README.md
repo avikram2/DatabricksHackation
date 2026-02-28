@@ -1,4 +1,38 @@
-utils/county_coords.py
-Problem: the RMA data has county names and FIPS codes but no coordinates. We need lat/lon to call the weather API.
+# Databricks Hackathon — Crop Yield Intelligence Platform
 
-Solution: Download the US Census Bureau's 2020 county population centroid file — a free 300 KB CSV with exact lat/lon for every US county. We build a fips key (state_fips + county_fips) that matches exactly what RMA uses (already zero-padded), then left-join it onto the yield dataframe. A hard-coded fallback covers the 12 biggest corn-belt counties in case the Census URL is unreachable in the demo environment.
+County-level Corn & Soybean yield analysis (2010-2024, 32 US states) built on Databricks + Open-Meteo weather APIs.
+
+## Solution
+
+| Option | Directory | Description |
+|--------|-----------|-------------|
+| 1 | `option1_weather_signal_detection/` | Correlate historical weather with yield, flag anomalies, explain outliers |
+
+## Data Source
+- **Yields**: USDA RMA County Yields Report (Corn + Soybeans, 34,712 rows)
+- **Weather**: Open-Meteo Historical API (free, no API key required)
+- **County Centroids**: US Census Bureau 2020 county population centroids
+
+## Databricks Architecture
+
+```
+Databricks Workspace
+  Delta Lake     -- persistent yield + weather tables (bronze/silver/gold)
+  MLflow         -- model experiment tracking and registry
+  Databricks SQL -- interactive dashboards
+  Notebooks      -- 5-stage Python pipeline
+```
+
+## Quick Start
+
+```bash
+pip install -r option1_weather_signal_detection/requirements.txt
+```
+
+Upload each `0N_*.py` file to Databricks as a notebook and run in order (01 to 05).
+All notebooks also run locally -- Spark/Delta calls gracefully fall back to pandas.
+
+## Key Findings
+- 2012 drought: Z-score < -2 in 80%+ of Corn Belt counties, most anomalous year in dataset
+- Top signals: growing-season precipitation, Growing Degree Days, heat-stress days (>95F)
+- 2022 collapse: July heat waves drove southern-tier yield losses of 15-25%
