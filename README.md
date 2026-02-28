@@ -36,3 +36,4 @@ All notebooks also run locally -- Spark/Delta calls gracefully fall back to pand
 - 2012 drought: Z-score < -2 in 80%+ of Corn Belt counties, most anomalous year in dataset
 - Top signals: growing-season precipitation, Growing Degree Days, heat-stress days (>95F)
 - 2022 collapse: July heat waves drove southern-tier yield losses of 15-25%
+
