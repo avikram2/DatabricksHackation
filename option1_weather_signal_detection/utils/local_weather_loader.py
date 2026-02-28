@@ -173,7 +173,7 @@ def _load_year_file(year: int, ghcn_dir: Path, valid_stations: set[str]) -> pd.D
         path,
         names=COLS,
         dtype={"station_id": str, "date": str, "element": str,
-               "data_value": "Int32", "q_flag": str},
+               "data_value": float, "q_flag": str},
         chunksize=500_000,
         compression="infer",
     ):
@@ -188,12 +188,11 @@ def _load_year_file(year: int, ghcn_dir: Path, valid_stations: set[str]) -> pd.D
             continue
 
         sub["date"] = pd.to_datetime(sub["date"], format="%Y%m%d", errors="coerce")
-        sub = sub.dropna(subset=["date"])
+        sub = sub.dropna(subset=["date", "data_value"])
         sub = sub[sub["date"].dt.month.isin(GROWING_MONTHS)]
         if sub.empty:
             continue
 
-        sub["data_value"] = pd.to_numeric(sub["data_value"], errors="coerce")
         # Convert tenths → actual units
         temp_mask = sub["element"].isin({"TMAX", "TMIN"})
         sub.loc[temp_mask, "data_value"] /= 10.0          # tenths °C → °C

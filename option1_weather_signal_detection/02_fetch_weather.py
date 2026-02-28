@@ -1,28 +1,12 @@
 # Databricks notebook source
 # Option 1 — Notebook 02: Fetch Historical Weather Data
 #
-# Weather source priority (automatic fallback):
+# Weather source: NOAA GHCN-Daily local bulk files (no API, no rate limits).
 #
-#   0. NOAA GHCN-Daily local files (BEST — no API, no rate limits)
-#      Download 16 files (~1.5 GB total) once and never worry about limits.
-#      Files: ghcnd-stations.txt + 2010.csv.gz … 2024.csv.gz
-#      Place in: option1_weather_signal_detection/data/ghcn/
-#      Set WEATHER_SOURCE="ghcn_local" or run with "auto" after downloading.
+# Download the 16 required files once with:
+#   python option1_weather_signal_detection/download_ghcn.py
 #
-#   1. DATABRICKS MARKETPLACE — NOAA GSOD (best for Databricks without local files)
-#      No API calls. Already a Delta table in the workspace.
-#      Add from Marketplace: search "NOAA Global Surface Summary of Day"
-#
-#   2. NASA POWER API (fallback when not on Databricks)
-#      Free, no API key. ~2-5s per request.
-#      URL: https://power.larc.nasa.gov/api/temporal/daily/point
-#
-#   3. Open-Meteo archive API (last resort)
-#      Free, no key. Has a per-hour rate limit (~10k req/hour).
-#      Full disk cache + resume on re-run — hitting the limit just means
-#      re-running later to fetch the remainder.
-#
-# Set WEATHER_SOURCE below to force a specific source, or leave as "auto".
+# Files are saved to: option1_weather_signal_detection/data/ghcn/
 
 # COMMAND ----------
 
@@ -38,27 +22,18 @@ from config import (
     DATABRICKS_WEATHER_TABLE,
     WEATHER_CACHE,
     WEATHER_DELTA,
-    WEATHER_FETCH_DELAY_S,
     YEAR_MAX,
     YEAR_MIN,
     YIELD_DELTA,
 )
-from utils import fetch_weather_batch, get_spark, read_delta, write_delta
+from utils import get_spark, read_delta, write_delta
+from utils.local_weather_loader import build_weather_from_ghcn, check_ghcn_files
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 log = logger
-# ── Source selection ──────────────────────────────────────────────────────────
-# "auto"        : try GHCN local → NOAA GSOD → NASA POWER → Open-Meteo in that order
-# "ghcn_local"  : NOAA GHCN-Daily bulk files (best — no API, no rate limits)
-#                 Download files first:  check_ghcn_files(years) prints what to get
-#                 Place files in: option1_weather_signal_detection/data/ghcn/
-# "noaa_gsod"   : Databricks Marketplace NOAA data only
-# "nasa_power"  : NASA POWER API only (good default when not on Databricks)
-# "open_meteo"  : Open-Meteo archive API only
-WEATHER_SOURCE = "auto"
 
-# Directory for GHCN-Daily bulk files (relative to this notebook)
+# Directory containing ghcnd-stations.txt and YYYY.csv.gz files
 GHCN_DIR = Path(__file__).parent / "data" / "ghcn"
 
 # COMMAND ----------
@@ -68,9 +43,10 @@ GHCN_DIR = Path(__file__).parent / "data" / "ghcn"
 # COMMAND ----------
 try:
     spark = get_spark()
-except:
+except Exception:
     spark = None
-    logger.info("No spark")
+    logger.info("No Spark session — running locally.")
+
 yield_df = read_delta(YIELD_DELTA, spark=spark)
 
 coords = (
@@ -79,210 +55,45 @@ coords = (
 )
 years = list(range(YEAR_MIN, YEAR_MAX + 1))
 
-print(f"Counties: {len(coords)}")
-print(f"Years:    {years[0]} – {years[-1]}")
-print(f"Pairs:    {len(coords) * len(years):,}")
-print(f"Source:   {WEATHER_SOURCE}")
-
-weather_df = None
+print(f"Counties : {len(coords)}")
+print(f"Years    : {years[0]} – {years[-1]}")
+print(f"Pairs    : {len(coords) * len(years):,}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 2. Source 0 — NOAA GHCN-Daily local files (no API, no rate limits)
+# MAGIC ## 2. Fetch weather — NOAA GHCN-Daily local files
 
 # COMMAND ----------
 
-if WEATHER_SOURCE in ("auto", "ghcn_local"):
-    from utils.local_weather_loader import build_weather_from_ghcn, check_ghcn_files
+# Show which files are present / missing before starting
+check_ghcn_files(years, GHCN_DIR)
 
-    # Print a checklist so the user knows which files are present / missing
-    check_ghcn_files(years, GHCN_DIR)
+ghcn_cache = str(Path(WEATHER_CACHE).with_name("weather_ghcn_cache.csv"))
+log.info("Building weather from GHCN-Daily (dir: %s, cache: %s) …", GHCN_DIR, ghcn_cache)
 
-    ghcn_cache = str(Path(WEATHER_CACHE).with_name("weather_ghcn_cache.csv"))
-    log.info(
-        "Attempting NOAA GHCN-Daily from local files (dir: %s, cache: %s) …",
-        GHCN_DIR, ghcn_cache,
-    )
-
-    try:
-        weather_df = build_weather_from_ghcn(
-            coords,
-            years,
-            ghcn_dir=GHCN_DIR,
-            cache_path=ghcn_cache,
-        )
-        if weather_df is not None and not weather_df.empty:
-            log.info(
-                "GHCN-Daily: loaded %d (county, year) records — no API calls needed.",
-                len(weather_df),
-            )
-        else:
-            log.warning(
-                "GHCN-Daily returned no data. "
-                "Download the files listed above and re-run, "
-                "or proceed with API fallback."
-            )
-            weather_df = None
-    except Exception as exc:
-        log.warning("GHCN-Daily failed: %s — falling back to next source.", exc)
-        weather_df = None
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 3. Source 1 — NOAA GSOD via Databricks Marketplace
-
-# COMMAND ----------
-
-if weather_df is None and WEATHER_SOURCE in ("auto", "noaa_gsod") and spark is not None:
-    try:
-        from utils.databricks_weather import build_weather_from_gsod
-
-        log.info("Attempting NOAA GSOD from Databricks Marketplace …")
-        weather_df = build_weather_from_gsod(spark, coords, years)
-
-        if weather_df is not None and not weather_df.empty:
-            log.info(
-                "NOAA GSOD: loaded %d (county, year) records — no API calls needed.",
-                len(weather_df),
-            )
-        else:
-            log.warning(
-                "NOAA GSOD returned no data. "
-                "Add the dataset from Databricks Marketplace and re-run, "
-                "or proceed with API fallback."
-            )
-            weather_df = None
-    except Exception as exc:
-        log.warning("NOAA GSOD failed: %s — falling back to API.", exc)
-        weather_df = None
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 4. Source 2 — NASA POWER API (fallback)
-
-# COMMAND ----------
-
-if weather_df is None and WEATHER_SOURCE in ("auto", "nasa_power"):
-    try:
-        from utils.nasa_power_api import fetch_weather_batch_nasa
-
-        nasa_cache = str(Path(WEATHER_CACHE).with_name("weather_nasa_cache.csv"))
-        log.info(
-            "Fetching from NASA POWER API "
-            "(cache: %s — re-run resumes automatically) …", nasa_cache
-        )
-        weather_df = fetch_weather_batch_nasa(
-            coords,
-            years,
-            delay_s=0.05,           # NASA recommends < 30 req/s; 4 workers × 0.05s ≈ 80 req/s peak → stay safe
-            cache_path=nasa_cache,
-        )
-
-        if weather_df is not None and not weather_df.empty:
-            log.info("NASA POWER: %d records fetched/loaded.", len(weather_df))
-        else:
-            log.warning("NASA POWER returned no data — falling back to Open-Meteo.")
-            weather_df = None
-    except Exception as exc:
-        log.warning("NASA POWER failed: %s — falling back to Open-Meteo.", exc)
-        weather_df = None
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 5. Source 3 — Open-Meteo archive API (cached, resumable)
-
-# COMMAND ----------
-
-if weather_df is None and WEATHER_SOURCE in ("auto", "open_meteo"):
-    log.info(
-        "Fetching from Open-Meteo archive API "
-        "(cache: %s — re-run resumes from where it left off) …",
-        WEATHER_CACHE,
-    )
-
-    if spark is not None:
-        # ── Databricks: distribute via Pandas UDF ───────────────────────────
-        from pyspark.sql.types import (
-            DoubleType, IntegerType, StringType, StructField, StructType,
-        )
-        from pyspark.sql.functions import pandas_udf, PandasUDFType
-        import time
-
-        WEATHER_SCHEMA = StructType([
-            StructField("fips",             StringType()),
-            StructField("year",             IntegerType()),
-            StructField("tmax_mean_c",      DoubleType()),
-            StructField("tmin_mean_c",      DoubleType()),
-            StructField("tavg_mean_c",      DoubleType()),
-            StructField("precip_total_mm",  DoubleType()),
-            StructField("gdd_base10",       DoubleType()),
-            StructField("heat_stress_days", DoubleType()),
-            StructField("drought_days",     DoubleType()),
-            StructField("et0_total_mm",     DoubleType()),
-            StructField("solar_total_mj",   DoubleType()),
-            StructField("wind_max_mean_ms", DoubleType()),
-        ])
-
-        combos = pd.DataFrame(
-            [(r.fips, r.lat, r.lon, y) for _, r in coords.iterrows() for y in years],
-            columns=["fips", "lat", "lon", "year"],
-        )
-        combos_sdf = spark.createDataFrame(combos)
-
-        @pandas_udf(WEATHER_SCHEMA, PandasUDFType.GROUPED_MAP)
-        def fetch_weather_udf(pdf: pd.DataFrame) -> pd.DataFrame:
-            import sys, time
-            sys.path.insert(0, "/dbfs/FileStore/hackathon")
-            from utils.weather_api import fetch_growing_season_weather
-
-            results = []
-            for _, row in pdf.iterrows():
-                rec = fetch_growing_season_weather(row["lat"], row["lon"], int(row["year"]))
-                if rec:
-                    rec["fips"] = row["fips"]
-                    results.append(rec)
-                time.sleep(0.15)
-            return (
-                pd.DataFrame(results)
-                if results
-                else pd.DataFrame(columns=WEATHER_SCHEMA.fieldNames())
-            )
-
-        weather_sdf = combos_sdf.groupby("fips", "year").apply(fetch_weather_udf)
-        weather_df = weather_sdf.toPandas()
-
-    else:
-        # ── Local: parallel threaded fetch with disk cache ──────────────────
-        weather_df = fetch_weather_batch(
-            coords,
-            years,
-            delay_s=WEATHER_FETCH_DELAY_S,
-            cache_path=WEATHER_CACHE,
-            max_workers=6,
-        )
+weather_df = build_weather_from_ghcn(
+    coords,
+    years,
+    ghcn_dir=GHCN_DIR,
+    cache_path=ghcn_cache,
+)
 
 if weather_df is None or weather_df.empty:
     raise RuntimeError(
-        "All weather data sources failed.\n"
-        "Options (in recommended order):\n"
-        "  1. Download NOAA GHCN-Daily files (no API, no rate limits — BEST option):\n"
-        "       Run check_ghcn_files(years) to see exactly which files to download.\n"
-        "       Station metadata: https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt\n"
-        "       Yearly files:     https://www.ncei.noaa.gov/pub/data/ghcn/daily/by_year/YYYY.csv.gz\n"
-        "       Place in: option1_weather_signal_detection/data/ghcn/\n"
-        "       Then set WEATHER_SOURCE='ghcn_local' and re-run.\n"
-        "  2. On Databricks: add NOAA GSOD from Marketplace and set WEATHER_SOURCE='noaa_gsod'\n"
-        "  3. Wait for Open-Meteo rate limit to reset (1 hour) and re-run — cache resumes\n"
-        "  4. Set WEATHER_SOURCE='nasa_power' to use the NASA API instead"
+        "GHCN-Daily returned no data.\n"
+        "Download the bulk files first:\n"
+        "  python option1_weather_signal_detection/download_ghcn.py\n\n"
+        "Or check which files are missing:\n"
+        "  python option1_weather_signal_detection/download_ghcn.py --check"
     )
 
-print(f"\nWeather source used:    {weather_df.get('source', pd.Series(['unknown'])).mode()[0] if 'source' in weather_df.columns else 'see logs'}")
-print(f"Weather records loaded: {len(weather_df):,}")
+log.info("GHCN-Daily: %d (county, year) records loaded.", len(weather_df))
+print(f"\nWeather records: {len(weather_df):,}")
 print(weather_df.head(3))
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 6. Quality checks & imputation
+# MAGIC ## 3. Quality checks & imputation
 
 # COMMAND ----------
 
@@ -303,7 +114,7 @@ for col in interp_cols:
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 7. Derived indices
+# MAGIC ## 4. Derived indices
 
 # COMMAND ----------
 
@@ -311,37 +122,27 @@ weather_df["precip_z"] = weather_df.groupby("fips")["precip_total_mm"].transform
     lambda s: (s - s.mean()) / (s.std() + 1e-6)
 )
 
-if "et0_total_mm" in weather_df.columns:
-    weather_df["cwsi"] = (
-        weather_df["et0_total_mm"] / weather_df["precip_total_mm"].clip(lower=1)
-    ).round(3)
-else:
-    # CWSI proxy when ET0 is unavailable (NASA POWER / NOAA GSOD path)
-    # Use temperature-based Hargreaves ET0 estimate:
-    #   ET0_hargreaves ≈ 0.0023 × (Tmax - Tmin)^0.5 × (Tavg + 17.8) × Ra
-    # Ra (extraterrestrial radiation) approximated as constant 30 MJ/m²/day
-    if "tmax_mean_c" in weather_df.columns and "tmin_mean_c" in weather_df.columns:
-        weather_df["et0_estimate_mm"] = (
-            0.0023
-            * (weather_df["tmax_mean_c"] - weather_df["tmin_mean_c"]).clip(lower=0) ** 0.5
-            * (weather_df["tavg_mean_c"] + 17.8)
-            * 30 * 214      # Ra × ~214 growing season days
-        )
-        weather_df["cwsi"] = (
-            weather_df["et0_estimate_mm"] / weather_df["precip_total_mm"].clip(lower=1)
-        ).round(3)
-    else:
-        weather_df["cwsi"] = float("nan")
+# CWSI: Crop Water Stress Index — Hargreaves ET0 estimate since GHCN has no radiation
+# ET0_hargreaves ≈ 0.0023 × (Tmax - Tmin)^0.5 × (Tavg + 17.8) × Ra
+# Ra ≈ 30 MJ/m²/day mean; ~214 growing-season days
+weather_df["et0_estimate_mm"] = (
+    0.0023
+    * (weather_df["tmax_mean_c"] - weather_df["tmin_mean_c"]).clip(lower=0) ** 0.5
+    * (weather_df["tavg_mean_c"] + 17.8)
+    * 30 * 214
+)
+weather_df["cwsi"] = (
+    weather_df["et0_estimate_mm"] / weather_df["precip_total_mm"].clip(lower=1)
+).round(3)
 
-if "heat_stress_days" in weather_df.columns and "gdd_base10" in weather_df.columns:
-    max_gdd = weather_df.groupby("fips")["gdd_base10"].transform("max").clip(lower=1)
-    weather_df["heat_fraction"] = (weather_df["heat_stress_days"] / max_gdd).round(4)
+max_gdd = weather_df.groupby("fips")["gdd_base10"].transform("max").clip(lower=1)
+weather_df["heat_fraction"] = (weather_df["heat_stress_days"] / max_gdd).round(4)
 
 print(weather_df.describe().round(2))
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 8. Persist to Delta Lake
+# MAGIC ## 5. Persist to Delta Lake
 
 # COMMAND ----------
 
