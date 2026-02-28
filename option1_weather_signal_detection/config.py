@@ -22,8 +22,16 @@ WEATHER_DELTA = str(DELTA_ROOT / "weather")
 MERGED_DELTA = str(DELTA_ROOT / "merged")
 ANOMALY_DELTA = str(DELTA_ROOT / "anomalies")
 
+# Ensure local output directories exist (no-op on Databricks where DBFS handles this)
+(ROOT / "data").mkdir(parents=True, exist_ok=True)
+DELTA_ROOT.mkdir(parents=True, exist_ok=True)
+
 # Cache for county centroids (avoid re-downloading every run)
 CENTROID_CACHE = str(ROOT / "data" / "county_centroids.csv")
+
+# Cache for fetched weather records — rows already in this file are skipped on
+# the next run, so partial fetches can be resumed without re-downloading.
+WEATHER_CACHE = str(ROOT / "data" / "weather_cache.csv")
 
 # MLflow experiment name
 MLFLOW_EXPERIMENT = "/Hackathon/WeatherYieldSignals"
@@ -52,8 +60,10 @@ ISOLATION_FOREST_CONTAMINATION = 0.08   # ~8% of samples expected to be anomalou
 # Top-N states to focus on for visualisation (by data volume)
 FOCUS_STATES = ["IA", "IL", "IN", "MN", "OH", "NE", "KS", "MO", "SD", "ND"]
 
-# Open-Meteo fetch delay (seconds between requests — be polite to the free API)
-WEATHER_FETCH_DELAY_S = 0.15
+# Open-Meteo free-tier limits: ~5 req/s, 10 000 req/day.
+# With 6 parallel workers each sleeping this long before firing, steady-state
+# throughput = 6 / (delay + ~0.5 s network) ≈ 4 req/s — safely under the cap.
+WEATHER_FETCH_DELAY_S = 1.0
 
 # ---------------------------------------------------------------------------
 # Databricks-specific (ignored when running locally)

@@ -17,7 +17,10 @@ Variables returned per year:
 """
 
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -74,6 +77,8 @@ def fetch_growing_season_weather(
     Fetch one year of growing-season weather for a county centroid.
 
     Returns a dict of aggregated weather features, or None on failure.
+    Handles HTTP 429 (rate limit) by reading the Retry-After header and
+    sleeping before retrying — 429s do not consume a retry slot.
     """
     start = f"{year}-{GROWING_SEASON_START}"
     end = f"{year}-{GROWING_SEASON_END}"
@@ -90,6 +95,19 @@ def fetch_growing_season_weather(
     for attempt in range(retries):
         try:
             resp = requests.get(ARCHIVE_URL, params=params, timeout=20)
+
+            # 429: respect the Retry-After header before the next attempt.
+            # Note: this does advance the attempt counter, so 3 consecutive
+            # 429 responses will exhaust retries and return None.
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                logger.warning(
+                    "Rate limited (429) for (%s,%s,%d) — sleeping %ds",
+                    lat, lon, year, retry_after,
+                )
+                time.sleep(retry_after)
+                continue   # retry same attempt index
+
             resp.raise_for_status()
             data = resp.json()
             daily_raw = data.get("daily", {})
@@ -110,34 +128,108 @@ def fetch_growing_season_weather(
                 return None
 
 
+def _load_weather_cache(cache_path: str | None) -> pd.DataFrame:
+    """Load previously fetched weather records from disk, or return empty DataFrame."""
+    if not cache_path:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(cache_path, dtype={"fips": str})
+        logger.info("Loaded %d cached weather records from %s", len(df), cache_path)
+        return df
+    except FileNotFoundError:
+        return pd.DataFrame()
+
+
+def _save_weather_cache(records: list[dict], cache_path: str | None) -> None:
+    """Write the full list of records to the cache CSV."""
+    if not cache_path or not records:
+        return
+    pd.DataFrame(records).to_csv(cache_path, index=False)
+
+
 def fetch_weather_batch(
     coords_df: pd.DataFrame,
     years: list[int],
-    delay_s: float = 0.15,
+    delay_s: float = 0.3,
+    cache_path: str | None = None,
+    max_workers: int = 6,
 ) -> pd.DataFrame:
     """
-    Fetch weather for all (fips, year) combinations.
+    Fetch weather for all (fips, year) combinations, with disk cache and
+    parallel I/O via ThreadPoolExecutor.
+
+    On the first run every (fips, year) is fetched and written to cache_path.
+    On subsequent runs, rows already present in the cache are skipped entirely —
+    only new (fips, year) pairs hit the network.
+
+    Throughput: max_workers=6 with delay_s=0.3 per thread → ~20 req/s, a
+    respectful rate for the Open-Meteo free tier.
 
     coords_df must have columns: fips, lat, lon
-    Returns a long DataFrame with one row per (fips, year).
+    Returns a DataFrame with one row per (fips, year).
     """
-    records = []
-    unique_locations = coords_df.drop_duplicates("fips")[["fips", "lat", "lon"]]
-    total = len(unique_locations) * len(years)
-    done = 0
+    # --- 1. Load existing cache -------------------------------------------------
+    cached_df = _load_weather_cache(cache_path)
+    if not cached_df.empty:
+        done_keys: set[tuple] = set(zip(cached_df["fips"], cached_df["year"].astype(int)))
+    else:
+        done_keys = set()
 
-    for _, loc in unique_locations.iterrows():
-        if pd.isna(loc["lat"]) or pd.isna(loc["lon"]):
-            continue
-        for year in years:
-            result = fetch_growing_season_weather(loc["lat"], loc["lon"], year)
-            if result:
-                result["fips"] = loc["fips"]
-                records.append(result)
-            done += 1
-            if done % 50 == 0:
-                pct = 100 * done / total
-                logger.info("Weather fetch progress: %d/%d (%.1f%%)", done, total, pct)
-            time.sleep(delay_s)
+    all_records: list[dict] = [] if cached_df.empty else cached_df.to_dict("records")
 
-    return pd.DataFrame(records)
+    # --- 2. Build the todo list -------------------------------------------------
+    unique_locs = coords_df.drop_duplicates("fips")[["fips", "lat", "lon"]]
+    todo = [
+        (str(row["fips"]), float(row["lat"]), float(row["lon"]), int(year))
+        for _, row in unique_locs.iterrows()
+        for year in years
+        if not pd.isna(row["lat"]) and (str(row["fips"]), int(year)) not in done_keys
+    ]
+
+    if not todo:
+        logger.info("All %d records already cached — skipping network fetch.", len(all_records))
+        return cached_df
+
+    logger.info(
+        "Fetching %d (fips, year) pairs using %d workers "
+        "(%.0f cached, %.0f skipped).",
+        len(todo), max_workers, len(all_records), len(done_keys),
+    )
+
+    # --- 3. Parallel fetch with periodic cache saves ----------------------------
+    lock = threading.Lock()
+    completed = [0]
+
+    def _fetch_one(fips: str, lat: float, lon: float, year: int) -> dict | None:
+        time.sleep(delay_s)   # polite per-thread rate limiting
+        result = fetch_growing_season_weather(lat, lon, year)
+        if result:
+            result["fips"] = fips
+        return result
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_one, fips, lat, lon, year): (fips, year)
+            for fips, lat, lon, year in todo
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            with lock:
+                if result:
+                    all_records.append(result)
+                completed[0] += 1
+                if completed[0] % 200 == 0:
+                    pct = 100 * completed[0] / len(todo)
+                    logger.info(
+                        "Weather fetch: %d/%d (%.1f%%) — saving cache …",
+                        completed[0], len(todo), pct,
+                    )
+                    _save_weather_cache(all_records, cache_path)
+
+    # --- 4. Final cache save ----------------------------------------------------
+    _save_weather_cache(all_records, cache_path)
+    logger.info(
+        "Fetch complete. Total records: %d (fetched %d new, skipped %d cached).",
+        len(all_records), completed[0], len(done_keys),
+    )
+    return pd.DataFrame(all_records)

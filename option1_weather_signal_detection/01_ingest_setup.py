@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+
 # Allow imports from sibling utils/ when running as a plain script
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -69,7 +71,7 @@ def load_yield_csv(path) -> pd.DataFrame:
     df["county_code"] = df["county_code"].astype(str).str.zfill(3)
     df["fips"] = df["state_code"] + df["county_code"]
 
-    log.info("Loaded %d rows × %d columns", *df.shape)
+    log.info("Loaded %d rows x %d columns", *df.shape)
     return df
 
 
@@ -145,8 +147,11 @@ print(yield_df[["fips", "county_name", "commodity_name", "year", "yield_bu_ac", 
 # MAGIC ## 5. Persist to Delta Lake
 
 # COMMAND ----------
-
-spark = get_spark()
+try:
+    spark = get_spark()
+except:
+    spark = None
+    logger.info("No Spark")
 
 # Write yield data
 write_delta(yield_df, YIELD_DELTA, spark=spark, partition_by=["commodity_name", "year"])

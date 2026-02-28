@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
     DATABRICKS_WEATHER_TABLE,
+    WEATHER_CACHE,
     WEATHER_DELTA,
     WEATHER_FETCH_DELAY_S,
     YEAR_MIN,
@@ -36,8 +37,10 @@ log = logging.getLogger(__name__)
 # MAGIC ## 1. Load yield data to get the list of (fips, lat, lon) pairs
 
 # COMMAND ----------
-
-spark = get_spark()
+try:
+    spark = get_spark()
+except:
+    spark = None
 yield_df = read_delta(YIELD_DELTA, spark=spark)
 
 # Unique counties with valid coordinates
@@ -117,10 +120,17 @@ if spark is not None:
 
 else:
     # -----------------------------------------------------------------------
-    # Local path: serial fetch (rate-limited, ~10 min for full dataset)
+    # Local path: parallel fetch with disk cache
+    # 6 workers × 0.15 s delay → ~20 req/s (≈ 6-8× faster than serial).
+    # Already-fetched (fips, year) pairs are skipped on re-runs.
     # -----------------------------------------------------------------------
-    log.info("Running serial weather fetch (local mode) …")
-    weather_df = fetch_weather_batch(coords, years, delay_s=WEATHER_FETCH_DELAY_S)
+    log.info("Running parallel weather fetch (local mode) …")
+    weather_df = fetch_weather_batch(
+        coords,
+        years,
+        delay_s=WEATHER_FETCH_DELAY_S,
+        cache_path=WEATHER_CACHE,
+    )
 
 print(f"Weather records fetched: {len(weather_df)}")
 print(weather_df.head())
