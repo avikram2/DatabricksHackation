@@ -25,8 +25,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 CENSUS_CENTROID_URL = (
-    "https://www2.census.gov/geo/docs/reference/cenpop2020/county/"
-    "CenPop2020_Mean_CO.txt"
+    "https://www2.census.gov/geo/docs/reference/cenpop2020/county/CenPop2020_Mean_CO.txt"
 )
 
 # Fallback: hard-coded centroids for the top corn/soy producing counties
@@ -82,9 +81,13 @@ def _download_census_centroids() -> pd.DataFrame | None:
         logger.info("Downloading county centroids from Census Bureau …")
         resp = requests.get(CENSUS_CENTROID_URL, timeout=30)
         resp.raise_for_status()
-        raw = pd.read_csv(io.StringIO(resp.text))
+        # Census CSVs are sometimes saved with a UTF-8 BOM (\xef\xbb\xbf).
+        # Reading from bytes with encoding="utf-8-sig" strips it automatically,
+        # preventing the first column name from arriving as "Ï»¿STATEFP".
+        raw = pd.read_csv(io.BytesIO(resp.content), encoding="utf-8-sig")
         raw.columns = raw.columns.str.strip().str.upper()
         # Columns: STATEFP, COUNTYFP, COUNAME, STNAME, POPULATION, LATITUDE, LONGITUDE
+        logger.debug("Census centroid columns: %s", list(raw.columns))
         df = pd.DataFrame(
             {
                 "fips": (
@@ -120,20 +123,20 @@ def _fallback_centroids() -> pd.DataFrame:
 
 def build_fips_lookup(yield_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Join yield_df with centroid data.
+    Join yield_df with centroid data on the 'fips' column.
 
-    yield_df must have 'State Code' and 'County Code' columns (as in the RMA CSV).
+    yield_df must already have a 'fips' column (5-digit zero-padded string).
+    load_yield_csv() in notebook 01 builds it from state_code + county_code,
+    so no reconstruction is needed here.
     Returns yield_df with lat/lon columns appended.
     """
     centroids = get_county_centroids()
 
-    # RMA codes are already zero-padded strings like '01', '033'
-    yield_df = yield_df.copy()
-    yield_df["state_fips"] = yield_df["State Code"].astype(str).str.strip().str.zfill(2)
-    yield_df["county_fips"] = (
-        yield_df["County Code"].astype(str).str.strip().str.zfill(3)
-    )
-    yield_df["fips"] = yield_df["state_fips"] + yield_df["county_fips"]
+    if "fips" not in yield_df.columns:
+        raise KeyError(
+            "yield_df has no 'fips' column. "
+            "Call load_yield_csv() before build_fips_lookup()."
+        )
 
     merged = yield_df.merge(
         centroids[["fips", "lat", "lon"]],

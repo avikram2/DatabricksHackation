@@ -1,9 +1,33 @@
 # Databricks notebook source
 # Option 1 — Notebook 04: Anomaly Detection & Explanation
 #
-# Identifies counties/seasons where yield is unusually high or low
-# relative to weather conditions, then explains WHY using SHAP local
-# explanations and rule-based interpretation.
+# Three-layer anomaly detection, each layer more sophisticated:
+#
+#   Layer 1 — Robust Z-score
+#       Flags yields that are statistically unusual for that county's own history.
+#       Catches absolute low/high years but cannot distinguish weather-driven
+#       losses from unexplained losses.
+#
+#   Layer 2 — XGBoost residual anomaly (NEW — uses model from notebook 03)
+#       Loads the trained XGBoost model, generates a predicted yield for every
+#       county-year based purely on weather features, then computes:
+#           residual = actual_yield - predicted_yield
+#       A large negative residual means the county UNDERPERFORMED beyond what
+#       weather alone would predict. This is the genuinely interesting anomaly.
+#       A county with 108 bu/ac during a severe drought is expected — its
+#       residual will be near zero. A county with 108 bu/ac in a normal year
+#       has a large negative residual — something non-meteorological happened.
+#
+#   Layer 3 — Isolation Forest on residuals only (IMPROVED)
+#       Previously ran on yield + weather features together, which meant it
+#       partly rediscovered what XGBoost already learned. Now runs on the
+#       residual alone, so it only finds structure that the model missed.
+#
+#   Explanation — SHAP local explanations (IMPROVED from rule engine)
+#       For each flagged row, uses SHAP to decompose the XGBoost prediction
+#       into per-feature contributions. Instead of hand-coded threshold rules,
+#       the top SHAP drivers ARE the explanation. The rule engine is kept as
+#       a readable supplement.
 
 # COMMAND ----------
 
@@ -31,9 +55,13 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
 
+# XGBoost models are saved by notebook 03 into a models/ subfolder
+MODEL_DIR = Path(__file__).parent / "models"
+MODEL_DIR.mkdir(exist_ok=True)
+
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 1. Load merged data
+# MAGIC ## 1. Load merged data and trained XGBoost models
 
 # COMMAND ----------
 
@@ -49,18 +77,44 @@ WEATHER_FEATURES = [
     if c in df.columns
 ]
 
+# Load XGBoost models saved by notebook 03
+xgb_models = {}
+try:
+    import joblib
+    import xgboost as xgb
+
+    for crop in CROPS:
+        model_path = MODEL_DIR / f"xgb_{crop.lower()}.pkl"
+        if model_path.exists():
+            xgb_models[crop] = joblib.load(model_path)
+            log.info("Loaded XGBoost model for %s", crop)
+        else:
+            log.warning(
+                "No saved model for %s at %s — run notebook 03 first. "
+                "Falling back to Z-score + raw Isolation Forest.", crop, model_path
+            )
+except ImportError as e:
+    log.warning("XGBoost/joblib not available: %s", e)
+
+print(f"Loaded models: {list(xgb_models.keys())}")
+print(f"Weather features available: {WEATHER_FEATURES}")
+
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 2. Layer 1 — Statistical anomaly (Z-score)
+# MAGIC ## 2. Layer 1 — Robust Z-score (statistical baseline)
 
 # COMMAND ----------
 
-# Per-county Z-score was pre-computed in notebook 01, but we recompute
-# to ensure we use a robust baseline (all years excluding the test row).
 df = df.sort_values(["fips", "commodity_name", "year"])
 
 def robust_zscore(series: pd.Series) -> pd.Series:
-    """Z-score using leave-one-out median/IQR for robustness."""
+    """
+    Leave-one-out IQR-based Z-score.
+
+    For each observation, compute the baseline (median + IQR) using ALL OTHER
+    years for that county. This prevents extreme outlier years from inflating
+    the standard deviation and masking their own anomaly.
+    """
     result = pd.Series(index=series.index, dtype=float)
     for idx in series.index:
         rest = series.drop(idx)
@@ -69,7 +123,7 @@ def robust_zscore(series: pd.Series) -> pd.Series:
         if iqr == 0:
             result[idx] = 0.0
         else:
-            result[idx] = (series[idx] - med) / (iqr / 1.349)  # normalise IQR to std
+            result[idx] = (series[idx] - med) / (iqr / 1.349)
     return result
 
 df["yield_z_robust"] = df.groupby(["fips", "commodity_name"])["yield_bu_ac"].transform(
@@ -81,14 +135,84 @@ df["z_direction"] = np.where(
     np.where(df["yield_z_robust"] > ANOMALY_ZSCORE_THRESHOLD, "HIGH", "NORMAL"),
 )
 
-print(f"Z-score anomalies: {df['z_anomaly'].sum():,} / {len(df):,}")
+print(f"Layer 1 — Z-score anomalies: {df['z_anomaly'].sum():,} / {len(df):,}")
 print(df[df["z_anomaly"]].groupby(["year", "z_direction"]).size().unstack(fill_value=0))
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 3. Layer 2 — Isolation Forest (multivariate anomaly in weather-yield space)
+# MAGIC ## 3. Layer 2 — XGBoost residual anomaly (weather-adjusted)
 
 # COMMAND ----------
+
+# For every county-year, predict what yield SHOULD have been given the weather.
+# The residual (actual - predicted) is what the model cannot explain.
+# A large negative residual = underperformed beyond weather expectations.
+
+df["xgb_predicted_yield"] = np.nan
+df["xgb_residual"] = np.nan
+df["xgb_residual_z"] = np.nan
+
+for crop in CROPS:
+    if crop not in xgb_models:
+        continue
+
+    model = xgb_models[crop]
+    mask = df["commodity_name"] == crop
+    subset = df.loc[mask].dropna(subset=WEATHER_FEATURES)
+
+    if subset.empty:
+        continue
+
+    X = subset[WEATHER_FEATURES].values
+    preds = model.predict(X)
+
+    df.loc[subset.index, "xgb_predicted_yield"] = preds
+    df.loc[subset.index, "xgb_residual"] = (
+        df.loc[subset.index, "yield_bu_ac"] - preds
+    )
+
+# Standardise residuals per county (so a -20 bu/ac residual in Iowa, where
+# yields are 180 bu/ac, is treated the same as -10 bu/ac in Alabama where
+# yields are 120 bu/ac)
+df["xgb_residual_z"] = df.groupby(["fips", "commodity_name"])["xgb_residual"].transform(
+    lambda s: (s - s.mean()) / (s.std() + 1e-6)
+)
+
+# Flag residual anomalies — yield underperformed the weather-based prediction
+RESIDUAL_THRESHOLD = 1.5   # same scale as yield Z-score threshold
+df["residual_anomaly"] = df["xgb_residual_z"] < -RESIDUAL_THRESHOLD
+df["residual_direction"] = np.where(
+    df["xgb_residual_z"] < -RESIDUAL_THRESHOLD, "UNEXPLAINED_LOW",
+    np.where(df["xgb_residual_z"] > RESIDUAL_THRESHOLD, "UNEXPLAINED_HIGH", "WEATHER_EXPLAINED"),
+)
+
+if df["xgb_residual"].notna().any():
+    print(f"\nLayer 2 — Residual anomalies: {df['residual_anomaly'].sum():,}")
+    print("\nMean residual by year (negative = model over-predicted → weather was worse than features capture):")
+    print(df.groupby("year")["xgb_residual"].mean().round(1).to_string())
+
+    # Key diagnostic: compare Z-score anomalies vs residual anomalies
+    weather_explained = df["z_anomaly"] & ~df["residual_anomaly"]
+    truly_unexplained = df["z_anomaly"] & df["residual_anomaly"]
+    print(f"\nOf {df['z_anomaly'].sum()} Z-score anomalies:")
+    print(f"  Weather-explained (low yield, bad weather):  {weather_explained.sum():,}")
+    print(f"  Truly unexplained (low yield, normal weather): {truly_unexplained.sum():,}")
+else:
+    log.warning("No residuals computed — XGBoost models not loaded. Skipping Layer 2.")
+    df["residual_anomaly"] = False
+    df["residual_direction"] = "WEATHER_EXPLAINED"
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 4. Layer 3 — Isolation Forest on residuals only (IMPROVED)
+
+# COMMAND ----------
+
+# Key change from original: Isolation Forest now runs on the RESIDUAL alone,
+# not on yield + weather features. This means:
+#   - It no longer rediscovers weather patterns XGBoost already captured
+#   - It finds non-linear structure in the unexplained variation
+#   - Anomalies it flags are genuinely surprising given the full model
 
 try:
     from sklearn.ensemble import IsolationForest
@@ -97,42 +221,155 @@ try:
     anomaly_all = []
 
     for crop in CROPS:
-        subset = df[df["commodity_name"] == crop].dropna(subset=WEATHER_FEATURES + ["yield_bu_ac"]).copy()
-        features_and_yield = WEATHER_FEATURES + ["yield_bu_ac"]
-        X = subset[features_and_yield].values
+        subset = df[df["commodity_name"] == crop].copy()
 
+        if df["xgb_residual"].notna().any() and crop in xgb_models:
+            # Improved path: run on residuals only
+            iso_input_cols = ["xgb_residual"]
+            log.info("%s: Isolation Forest running on XGBoost residuals.", crop)
+        else:
+            # Fallback: original approach (yield + weather) if no model available
+            iso_input_cols = WEATHER_FEATURES + ["yield_bu_ac"]
+            log.info("%s: Isolation Forest running on raw yield + weather (fallback).", crop)
+
+        valid = subset.dropna(subset=iso_input_cols)
+        if valid.empty:
+            continue
+
+        X = valid[iso_input_cols].values
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
 
         iso = IsolationForest(
-            n_estimators=200,
+            n_estimators=300,
             contamination=ISOLATION_FOREST_CONTAMINATION,
             random_state=42,
         )
-        subset["if_score"] = iso.fit_predict(X_scaled)           # -1 = anomaly
-        subset["if_anomaly_score"] = -iso.score_samples(X_scaled)  # higher = more anomalous
+        valid = valid.copy()
+        valid["if_score"] = iso.fit_predict(X_scaled)
+        valid["if_anomaly_score"] = -iso.score_samples(X_scaled)
+        anomaly_all.append(valid)
 
-        anomaly_all.append(subset)
+    df_if = pd.concat(anomaly_all, ignore_index=True) if anomaly_all else df.copy()
 
-    df_if = pd.concat(anomaly_all, ignore_index=True)
-    df_if["if_anomaly"] = df_if["if_score"] == -1
-
-    print(f"Isolation Forest anomalies: {df_if['if_anomaly'].sum():,}")
-    print(df_if[df_if["if_anomaly"]].groupby("year").size().rename("n_anomalies").to_string())
-
-    # Combine both anomaly flags
-    df_if["is_anomaly"] = df_if["z_anomaly"] | df_if["if_anomaly"]
+    if "if_score" in df_if.columns:
+        df_if["if_anomaly"] = df_if["if_score"] == -1
+        print(f"\nLayer 3 — Isolation Forest anomalies: {df_if['if_anomaly'].sum():,}")
+    else:
+        df_if["if_anomaly"] = False
+        df_if["if_anomaly_score"] = np.nan
 
 except ImportError:
-    log.warning("scikit-learn not available — using Z-score only.")
+    log.warning("scikit-learn not available — skipping Isolation Forest.")
     df_if = df.copy()
     df_if["if_anomaly"] = False
     df_if["if_anomaly_score"] = np.nan
-    df_if["is_anomaly"] = df_if["z_anomaly"]
+
+# Combined flag: anomalous by ANY of the three layers
+df_if["is_anomaly"] = (
+    df_if["z_anomaly"] |
+    df_if.get("residual_anomaly", pd.Series(False, index=df_if.index)) |
+    df_if["if_anomaly"]
+)
+
+print(f"\nCombined anomalies (any layer): {df_if['is_anomaly'].sum():,}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 4. Explain anomalies — weather driver attribution
+# MAGIC ## 5. SHAP local explanations for flagged rows (IMPROVED from rule engine)
+
+# COMMAND ----------
+
+# For each flagged county-year, use SHAP to decompose the XGBoost prediction
+# into per-feature contributions. The features with the largest |SHAP| values
+# are the model's data-driven explanation for why it predicted what it did.
+# The residual then tells us how much REMAINS unexplained.
+
+try:
+    import shap
+
+    shap_explanation_records = []
+
+    for crop in CROPS:
+        if crop not in xgb_models:
+            continue
+
+        model = xgb_models[crop]
+        explainer = shap.TreeExplainer(model)
+
+        flagged = df_if[
+            (df_if["commodity_name"] == crop) & df_if["is_anomaly"]
+        ].dropna(subset=WEATHER_FEATURES)
+
+        if flagged.empty:
+            continue
+
+        X_flagged = flagged[WEATHER_FEATURES].values
+        shap_vals = explainer.shap_values(X_flagged)   # shape: (n_flagged, n_features)
+
+        for i, (idx, row) in enumerate(flagged.iterrows()):
+            sv = shap_vals[i]
+            # Sort features by absolute SHAP value descending
+            ranked = sorted(
+                zip(WEATHER_FEATURES, sv),
+                key=lambda x: abs(x[1]),
+                reverse=True,
+            )
+            top3 = ranked[:3]
+
+            # Build a data-driven explanation from SHAP
+            shap_parts = []
+            for feat, val in top3:
+                direction = "increased" if val > 0 else "decreased"
+                feat_label = feat.replace("_", " ")
+                shap_parts.append(
+                    f"{feat_label} {direction} predicted yield by {abs(val):.1f} bu/ac"
+                )
+
+            residual = row.get("xgb_residual", np.nan)
+            residual_z = row.get("xgb_residual_z", np.nan)
+
+            if not pd.isna(residual):
+                unexplained = abs(residual)
+                direction_str = "below" if residual < 0 else "above"
+                residual_sentence = (
+                    f"After weather effects, actual yield was {unexplained:.1f} bu/ac "
+                    f"{direction_str} the model's prediction "
+                    f"(residual Z={residual_z:.2f}) — "
+                )
+                if abs(residual_z) > RESIDUAL_THRESHOLD:
+                    residual_sentence += "this gap is statistically significant and likely non-meteorological."
+                else:
+                    residual_sentence += "this gap is within normal prediction error."
+            else:
+                residual_sentence = ""
+
+            shap_explanation_records.append({
+                "index": idx,
+                "shap_explanation": "; ".join(shap_parts),
+                "residual_explanation": residual_sentence,
+                "top_driver": ranked[0][0] if ranked else "",
+                "top_driver_shap": ranked[0][1] if ranked else np.nan,
+            })
+
+    if shap_explanation_records:
+        shap_df = pd.DataFrame(shap_explanation_records).set_index("index")
+        df_if = df_if.join(shap_df, how="left")
+        log.info("SHAP explanations computed for %d flagged rows.", len(shap_df))
+    else:
+        df_if["shap_explanation"] = ""
+        df_if["residual_explanation"] = ""
+        df_if["top_driver"] = ""
+        df_if["top_driver_shap"] = np.nan
+
+except ImportError as e:
+    log.warning("SHAP not available — using rule-based explanation only: %s", e)
+    df_if["shap_explanation"] = ""
+    df_if["residual_explanation"] = ""
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 6. Rule-based explanation (supplementary — human-readable labels)
 
 # COMMAND ----------
 
@@ -144,83 +381,156 @@ EXTREME_EVENTS = {
     2023: "Mixed conditions",
 }
 
-def explain_anomaly(row: pd.Series) -> str:
-    """Generate a human-readable explanation for a yield anomaly row."""
+def rule_based_explanation(row: pd.Series) -> str:
+    """
+    Threshold-based labels to supplement SHAP with agronomic context.
+    Now secondary to SHAP — used as a readable cross-check.
+    """
     parts = []
 
-    # Precipitation signal
-    if "precip_z" in row and not pd.isna(row["precip_z"]):
+    if "precip_z" in row and not pd.isna(row.get("precip_z")):
         if row["precip_z"] < -1.5:
-            parts.append(f"severe drought (precip {row['precip_total_mm']:.0f} mm, {row['precip_z']:.1f} SD below avg)")
+            parts.append(f"drought (precip {row['precip_total_mm']:.0f} mm, Z={row['precip_z']:.1f})")
         elif row["precip_z"] > 1.5:
-            parts.append(f"excess moisture (precip {row['precip_total_mm']:.0f} mm, {row['precip_z']:.1f} SD above avg)")
+            parts.append(f"excess moisture (precip {row['precip_total_mm']:.0f} mm, Z={row['precip_z']:.1f})")
 
-    # Heat stress
-    if "heat_stress_days" in row and not pd.isna(row["heat_stress_days"]):
+    if "heat_stress_days" in row and not pd.isna(row.get("heat_stress_days")):
         if row["heat_stress_days"] > 20:
-            parts.append(f"extreme heat stress ({row['heat_stress_days']:.0f} days >35°C)")
+            parts.append(f"heat stress ({row['heat_stress_days']:.0f} days >35°C)")
 
-    # GDD signal (too high or too low)
     if "gdd_base10" in row and "commodity_name" in row:
-        gdd_threshold_low = 1200 if row.get("commodity_name") == "Corn" else 900
-        if row["gdd_base10"] < gdd_threshold_low:
-            parts.append(f"insufficient heat accumulation (GDD={row['gdd_base10']:.0f})")
+        gdd_threshold = 1200 if row.get("commodity_name") == "Corn" else 900
+        if not pd.isna(row.get("gdd_base10")) and row["gdd_base10"] < gdd_threshold:
+            parts.append(f"low GDD ({row['gdd_base10']:.0f})")
 
-    # CWSI (crop water stress)
     if "cwsi" in row and not pd.isna(row.get("cwsi")):
         if row["cwsi"] > 2.0:
-            parts.append(f"high crop water stress index ({row['cwsi']:.1f})")
+            parts.append(f"water stress (CWSI={row['cwsi']:.1f})")
 
-    # Known extreme event
     year = int(row.get("year", 0))
     if year in EXTREME_EVENTS:
-        parts.append(f"known climate event: {EXTREME_EVENTS[year]}")
+        parts.append(EXTREME_EVENTS[year])
 
-    if not parts:
-        parts.append("cause unclear — investigate local factors (pest, disease, management)")
+    return "; ".join(parts) if parts else "no clear weather signal — investigate non-meteorological factors"
 
-    direction = row.get("z_direction", "")
-    prefix = f"{'Unexpectedly LOW' if direction == 'LOW' else 'Unexpectedly HIGH'} yield (Z={row.get('yield_z_robust', 0):.2f}): "
-    return prefix + "; ".join(parts)
+
+def full_explanation(row: pd.Series) -> str:
+    """
+    Combine SHAP explanation + residual gap + rule-based labels
+    into a single readable string.
+    """
+    z = row.get("yield_z_robust", 0)
+    direction = "LOW" if z < 0 else "HIGH"
+    header = f"Unexpectedly {direction} yield (Z={z:.2f})"
+
+    shap_text = row.get("shap_explanation", "")
+    residual_text = row.get("residual_explanation", "")
+    rule_text = rule_based_explanation(row)
+
+    parts = [header]
+    if shap_text:
+        parts.append(f"Model attribution: {shap_text}")
+    if residual_text:
+        parts.append(residual_text)
+    parts.append(f"Weather context: {rule_text}")
+    return " | ".join(parts)
 
 
 anomaly_df = df_if[df_if["is_anomaly"]].copy()
-anomaly_df["explanation"] = anomaly_df.apply(explain_anomaly, axis=1)
+anomaly_df["explanation"] = anomaly_df.apply(full_explanation, axis=1)
 
 print(f"\nTotal flagged anomalies: {len(anomaly_df):,}")
-print("\nSample explanations:")
+print("\n=== Sample explanations ===")
 for _, row in anomaly_df.sample(min(5, len(anomaly_df)), random_state=1).iterrows():
-    print(f"  [{row.get('state_abbr','?')}, {row.get('county_name','?')}, {row.get('year','?')}, {row.get('commodity_name','?')}]")
-    print(f"  → {row['explanation']}\n")
+    print(f"\n  [{row.get('state_abbr','?')}, {row.get('county_name','?')}, "
+          f"{row.get('year','?')}, {row.get('commodity_name','?')}]")
+    print(f"  Actual: {row.get('yield_bu_ac','?'):.1f} bu/ac  |  "
+          f"Predicted: {row.get('xgb_predicted_yield', float('nan')):.1f} bu/ac  |  "
+          f"Residual: {row.get('xgb_residual', float('nan')):.1f} bu/ac")
+    print(f"  → {row['explanation']}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 5. Drought 2012 deep-dive
+# MAGIC ## 7. Anomaly type classification
 
 # COMMAND ----------
 
-print("=== 2012 Drought Analysis ===")
-drought_2012 = df_if[(df_if["year"] == 2012)].copy()
-print(f"Counties in 2012 dataset: {drought_2012['fips'].nunique()}")
-print(f"Anomalies flagged: {drought_2012['is_anomaly'].sum()}")
-print(f"Mean yield Z-score (2012): {drought_2012['yield_z_robust'].mean():.2f}")
+# Classify each anomaly by what kind it is — more useful than a binary flag
 
-corn_drought = drought_2012[drought_2012["commodity_name"] == "Corn"]
-print(f"\nCorn 2012 — median yield: {corn_drought['yield_bu_ac'].median():.1f} bu/ac")
-print(f"Corn median across all years: {df_if[df_if['commodity_name']=='Corn']['yield_bu_ac'].median():.1f} bu/ac")
+def classify_anomaly_type(row: pd.Series) -> str:
+    """
+    Four mutually exclusive anomaly types based on the three detection layers.
+
+    WEATHER_DRIVEN     — Z-score low AND residual near zero
+                         Weather explains it. Expected given conditions.
+    UNEXPLAINED        — Z-score low AND residual very negative
+                         Underperformed beyond what weather predicts.
+                         Investigate: pest, disease, management, reporting error.
+    RESIDUAL_ONLY      — Residual anomaly but Z-score normal
+                         Absolute yield is fine but the model expected more.
+                         Interesting: good absolute yield during bad weather year?
+    ISOLATION_ONLY     — Flagged by Isolation Forest only
+                         Unusual combination of features, not necessarily bad.
+    """
+    z_flag = row.get("z_anomaly", False)
+    r_flag = row.get("residual_anomaly", False)
+    if_flag = row.get("if_anomaly", False)
+
+    if z_flag and r_flag:
+        return "UNEXPLAINED"
+    elif z_flag and not r_flag:
+        return "WEATHER_DRIVEN"
+    elif r_flag and not z_flag:
+        return "RESIDUAL_ONLY"
+    elif if_flag:
+        return "ISOLATION_ONLY"
+    return "NORMAL"
+
+anomaly_df["anomaly_type"] = anomaly_df.apply(classify_anomaly_type, axis=1)
+
+print("\n=== Anomaly Type Distribution ===")
+print(anomaly_df.groupby(["commodity_name", "anomaly_type"]).size().unstack(fill_value=0))
+
+print("\n=== UNEXPLAINED anomalies by year (most interesting) ===")
+unexplained = anomaly_df[anomaly_df["anomaly_type"] == "UNEXPLAINED"]
+print(unexplained.groupby("year").size().rename("n_unexplained").to_string())
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 6. Persist anomaly table
+# MAGIC ## 8. 2012 drought deep-dive — weather-driven vs unexplained
+
+# COMMAND ----------
+
+print("=== 2012 Drought Deep-Dive ===")
+drought_2012 = df_if[df_if["year"] == 2012]
+print(f"Counties in 2012: {drought_2012['fips'].nunique()}")
+print(f"Z-score anomalies: {drought_2012['z_anomaly'].sum()}")
+print(f"Residual anomalies: {drought_2012.get('residual_anomaly', pd.Series(False)).sum()}")
+
+corn_2012 = drought_2012[drought_2012["commodity_name"] == "Corn"]
+if "xgb_residual" in corn_2012.columns:
+    print(f"\nCorn 2012:")
+    print(f"  Median actual yield:    {corn_2012['yield_bu_ac'].median():.1f} bu/ac")
+    print(f"  Median predicted yield: {corn_2012['xgb_predicted_yield'].median():.1f} bu/ac")
+    print(f"  Median residual:        {corn_2012['xgb_residual'].median():.1f} bu/ac")
+    print(f"\n  Interpretation: if residual ≈ 0, the model correctly anticipated")
+    print(f"  the yield loss from the drought weather features. The drought WAS")
+    print(f"  the explanation — no additional anomaly investigation needed.")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 9. Persist enriched anomaly table
 
 # COMMAND ----------
 
 save_cols = [
     "fips", "state_abbr", "county_name", "commodity_name", "irr_name",
-    "year", "yield_bu_ac", "yield_z_robust", "z_direction",
-    "z_anomaly", "if_anomaly", "is_anomaly",
-    "precip_total_mm", "gdd_base10", "heat_stress_days",
-    "precip_z", "cwsi", "lat", "lon",
+    "year", "yield_bu_ac", "xgb_predicted_yield", "xgb_residual", "xgb_residual_z",
+    "yield_z_robust", "z_direction", "residual_direction", "anomaly_type",
+    "z_anomaly", "residual_anomaly", "if_anomaly", "if_anomaly_score", "is_anomaly",
+    "precip_total_mm", "gdd_base10", "heat_stress_days", "precip_z", "cwsi",
+    "lat", "lon",
+    "shap_explanation", "residual_explanation", "top_driver", "top_driver_shap",
     "explanation",
 ]
 save_cols = [c for c in save_cols if c in anomaly_df.columns]
