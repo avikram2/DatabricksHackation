@@ -222,15 +222,22 @@ def _aggregate_station_year(grp: pd.DataFrame) -> dict:
     """Aggregate one station's growing-season daily records to season totals."""
     result = {}
 
-    tmax = grp.loc[grp["element"] == "TMAX", "data_value"].dropna()
-    tmin = grp.loc[grp["element"] == "TMIN", "data_value"].dropna()
+    # Index by date so TMAX/TMIN align by day, not by row position
+    tmax = (grp.loc[grp["element"] == "TMAX", ["date", "data_value"]]
+              .dropna().set_index("date")["data_value"])
+    tmin = (grp.loc[grp["element"] == "TMIN", ["date", "data_value"]]
+              .dropna().set_index("date")["data_value"])
     prcp = grp.loc[grp["element"] == "PRCP", "data_value"].fillna(0)
     wind = grp.loc[grp["element"] == "AWND", "data_value"].dropna()
 
-    if len(tmax) < 30 or len(tmin) < 30:    # need at least 30 days of temp data
+    common = tmax.index.intersection(tmin.index)
+    if len(common) < 30:    # need at least 30 days of overlapping temp data
+        logger.info("Dont have at least 30 days of overlapping temp data")
         return {}
 
-    tavg = (tmax.values + tmin.values[:len(tmax)]) / 2
+    tmax = tmax.loc[common]
+    tmin = tmin.loc[common]
+    tavg = (tmax.values + tmin.values) / 2
     gdd  = np.maximum(0, tavg - 10).sum()
 
     result = {
