@@ -107,7 +107,11 @@ print(corr_df.to_string(index=False))
 
 # COMMAND ----------
 
+MODEL_DIR = Path(__file__).parent / "models"
+MODEL_DIR.mkdir(exist_ok=True)
+
 try:
+    import joblib
     import mlflow
     import mlflow.xgboost
     import shap
@@ -142,6 +146,10 @@ try:
 
         cv_scores = cross_val_score(model, X, y, cv=5, scoring="r2")
         model.fit(X, y)
+
+        # Save model so notebook 04 can load it for residual-based anomaly detection
+        joblib.dump(model, MODEL_DIR / f"xgb_{crop.lower()}.pkl")
+        log.info("Saved model: models/xgb_%s.pkl", crop.lower())
 
         rmse = np.sqrt(mean_squared_error(y, model.predict(X)))
         r2 = r2_score(y, model.predict(X))
