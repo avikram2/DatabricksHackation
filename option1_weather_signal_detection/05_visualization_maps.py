@@ -36,8 +36,11 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # MAGIC ## 1. Load data
 
 # COMMAND ----------
+try:
+    spark = get_spark()
+except:
+    spark = None
 
-spark = get_spark()
 merged = read_delta(MERGED_DELTA, spark=spark)
 anomalies = read_delta(ANOMALY_DELTA, spark=spark)
 
@@ -63,12 +66,21 @@ try:
 
     def make_anomaly_map(year: int, crop: str = "Corn") -> folium.Map:
         """Create a choropleth map of yield Z-score anomalies for a given year."""
+        # Resolve which z-score column is available
+        if "yield_z_robust" in merged.columns:
+            z_col = "yield_z_robust"
+        elif "yield_zscore" in merged.columns:
+            z_col = "yield_zscore"
+        else:
+            log.warning("No yield z-score column found in merged data; skipping map.")
+            return None
+
         subset = merged[
             (merged["year"] == year) & (merged["commodity_name"] == crop)
-        ][["fips", "yield_z_robust", "yield_bu_ac", "county_name", "state_abbr"]].copy()
+        ][["fips", z_col, "yield_bu_ac", "county_name", "state_abbr"]].copy()
 
-        if "yield_z_robust" not in subset.columns and "yield_zscore" in subset.columns:
-            subset["yield_z_robust"] = subset["yield_zscore"]
+        if z_col != "yield_z_robust":
+            subset = subset.rename(columns={z_col: "yield_z_robust"})
 
         subset = subset.dropna(subset=["yield_z_robust"])
 
