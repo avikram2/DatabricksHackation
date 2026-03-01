@@ -9,6 +9,9 @@ build/
 *.parquet
 *.delta
 mlruns/
+mlflow.db
+*.db
+models/
 .databricks/
 *.html
 *.png
