@@ -17,8 +17,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Allow imports from sibling utils/ when running as a plain script
-sys.path.insert(0, str(Path(__file__).parent))
+try:
+    sys.path.insert(0, str(Path(__file__).parent))
+except:
+    pass
 
 from config import (
     CENTROID_CACHE,
