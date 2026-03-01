@@ -180,9 +180,11 @@ try:
         cv_scores = cross_val_score(model, X, y, cv=5, scoring="r2")
         model.fit(X, y)
 
-        # Save model for notebook 04 residual-based anomaly detection
+        # Save model + exact feature list — notebook 04 loads both to guarantee
+        # the same columns are used for prediction as were used for training.
         joblib.dump(model, MODEL_DIR / f"xgb_{crop.lower()}.pkl")
-        log.info("Saved model: models/xgb_%s.pkl", crop.lower())
+        joblib.dump(WEATHER_FEATURES, MODEL_DIR / f"xgb_{crop.lower()}_features.pkl")
+        log.info("Saved model + feature list: models/xgb_%s.pkl", crop.lower())
 
         rmse   = np.sqrt(mean_squared_error(y, model.predict(X)))
         r2     = r2_score(y, model.predict(X))

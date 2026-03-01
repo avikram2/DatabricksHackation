@@ -64,27 +64,27 @@ MODEL_DIR.mkdir(exist_ok=True)
 # MAGIC ## 1. Load merged data and trained XGBoost models
 
 # COMMAND ----------
-
-spark = get_spark()
+try:
+    spark = get_spark()
+except:
+    spark = None
 df = read_delta(MERGED_DELTA, spark=spark)
 
-WEATHER_FEATURES = [
-    c for c in [
-        "tmax_mean_c", "tmin_mean_c", "tavg_mean_c",
-        "precip_total_mm", "gdd_base10", "heat_stress_days",
-        "drought_days", "et0_total_mm", "precip_z", "cwsi",
-    ]
-    if c in df.columns
-]
+# Load XGBoost models and their saved feature lists from notebook 03.
+# Using the saved feature list is critical: it guarantees notebook 04 uses
+# exactly the same columns the model was trained on, preventing silent
+# dropna() failures when the merged table has extra NaN-heavy columns.
+xgb_models   = {}
+xgb_features = {}   # per-crop feature list saved alongside the model
 
-# Load XGBoost models saved by notebook 03
-xgb_models = {}
 try:
     import joblib
     import xgboost as xgb
 
     for crop in CROPS:
-        model_path = MODEL_DIR / f"xgb_{crop.lower()}.pkl"
+        model_path   = MODEL_DIR / f"xgb_{crop.lower()}.pkl"
+        feature_path = MODEL_DIR / f"xgb_{crop.lower()}_features.pkl"
+
         if model_path.exists():
             xgb_models[crop] = joblib.load(model_path)
             log.info("Loaded XGBoost model for %s", crop)
@@ -93,8 +93,40 @@ try:
                 "No saved model for %s at %s — run notebook 03 first. "
                 "Falling back to Z-score + raw Isolation Forest.", crop, model_path
             )
+            continue
+
+        if feature_path.exists():
+            xgb_features[crop] = joblib.load(feature_path)
+            log.info("Loaded feature list for %s: %s", crop, xgb_features[crop])
+        else:
+            # feature file missing (older run of notebook 03) — reconstruct safely
+            xgb_features[crop] = [
+                c for c in [
+                    "tmax_mean_c", "tmin_mean_c", "tavg_mean_c",
+                    "precip_total_mm", "gdd_base10", "heat_stress_days",
+                    "drought_days", "et0_total_mm", "solar_total_mj",
+                    "precip_z", "cwsi",
+                ]
+                if c in df.columns and df[c].notna().any()   # must match nb03 filter
+            ]
+            log.warning(
+                "Feature list file missing for %s — reconstructed from data "
+                "(re-run notebook 03 to fix permanently).", crop
+            )
+
 except ImportError as e:
     log.warning("XGBoost/joblib not available: %s", e)
+
+# Global feature list = union of all crop feature lists (for Isolation Forest fallback)
+all_saved_features = sorted({f for feats in xgb_features.values() for f in feats})
+WEATHER_FEATURES = all_saved_features if all_saved_features else [
+    c for c in [
+        "tmax_mean_c", "tmin_mean_c", "tavg_mean_c",
+        "precip_total_mm", "gdd_base10", "heat_stress_days",
+        "drought_days", "precip_z", "cwsi",
+    ]
+    if c in df.columns and df[c].notna().any()
+]
 
 print(f"Loaded models: {list(xgb_models.keys())}")
 print(f"Weather features available: {WEATHER_FEATURES}")
@@ -156,14 +188,16 @@ for crop in CROPS:
     if crop not in xgb_models:
         continue
 
-    model = xgb_models[crop]
-    mask = df["commodity_name"] == crop
-    subset = df.loc[mask].dropna(subset=WEATHER_FEATURES)
+    model        = xgb_models[crop]
+    crop_feats   = xgb_features.get(crop, WEATHER_FEATURES)   # use saved feature list
+    mask         = df["commodity_name"] == crop
+    subset       = df.loc[mask].dropna(subset=crop_feats)
 
     if subset.empty:
+        log.warning("%s: all rows dropped by dropna on features %s", crop, crop_feats)
         continue
 
-    X = subset[WEATHER_FEATURES].values
+    X = subset[crop_feats].values
     preds = model.predict(X)
 
     df.loc[subset.index, "xgb_predicted_yield"] = preds
@@ -297,21 +331,22 @@ try:
         model = xgb_models[crop]
         explainer = shap.TreeExplainer(model)
 
+        crop_feats = xgb_features.get(crop, WEATHER_FEATURES)
         flagged = df_if[
             (df_if["commodity_name"] == crop) & df_if["is_anomaly"]
-        ].dropna(subset=WEATHER_FEATURES)
+        ].dropna(subset=crop_feats)
 
         if flagged.empty:
             continue
 
-        X_flagged = flagged[WEATHER_FEATURES].values
+        X_flagged = flagged[crop_feats].values
         shap_vals = explainer.shap_values(X_flagged)   # shape: (n_flagged, n_features)
 
         for i, (idx, row) in enumerate(flagged.iterrows()):
             sv = shap_vals[i]
             # Sort features by absolute SHAP value descending
             ranked = sorted(
-                zip(WEATHER_FEATURES, sv),
+                zip(crop_feats, sv),
                 key=lambda x: abs(x[1]),
                 reverse=True,
             )
