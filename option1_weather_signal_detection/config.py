@@ -17,10 +17,12 @@ YIELD_CSV = ROOT / "data" / "RMACountyYieldsReport-399.csv"
 # Delta Lake / parquet paths (relative or DBFS paths on Databricks)
 # On Databricks use something like: "dbfs:/hackathon/yields"
 DELTA_ROOT = ROOT / "delta"
-YIELD_DELTA = str(DELTA_ROOT / "yields")
-WEATHER_DELTA = str(DELTA_ROOT / "weather")
-MERGED_DELTA = str(DELTA_ROOT / "merged")
-ANOMALY_DELTA = str(DELTA_ROOT / "anomalies")
+YIELD_DELTA      = str(DELTA_ROOT / "yields")
+WEATHER_DELTA    = str(DELTA_ROOT / "weather")
+MERGED_DELTA     = str(DELTA_ROOT / "merged")
+ANOMALY_DELTA    = str(DELTA_ROOT / "anomalies")
+CORR_DELTA       = str(DELTA_ROOT / "correlations")
+IMPORTANCE_DELTA = str(DELTA_ROOT / "importance")
 
 # Ensure local output directories exist (no-op on Databricks where DBFS handles this)
 (ROOT / "data").mkdir(parents=True, exist_ok=True)
@@ -69,7 +71,9 @@ WEATHER_FETCH_DELAY_S = 1.0
 # Databricks-specific (ignored when running locally)
 # ---------------------------------------------------------------------------
 DATABRICKS_CATALOG = "hackathon"
-DATABRICKS_SCHEMA = "crop_yields"
-DATABRICKS_YIELD_TABLE = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.yields"
-DATABRICKS_WEATHER_TABLE = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.weather"
-DATABRICKS_MERGED_TABLE = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.merged"
+DATABRICKS_SCHEMA  = "crop_yields"
+DATABRICKS_YIELD_TABLE      = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.yields"
+DATABRICKS_WEATHER_TABLE    = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.weather"
+DATABRICKS_MERGED_TABLE     = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.merged"
+DATABRICKS_CORR_TABLE       = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.correlations"
+DATABRICKS_IMPORTANCE_TABLE = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.importance"
