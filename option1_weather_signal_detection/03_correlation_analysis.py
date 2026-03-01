@@ -31,8 +31,11 @@ from config import (
     IMPORTANCE_DELTA,
     MERGED_DELTA,
     MLFLOW_EXPERIMENT,
+    TEST_YEARS,
     TRAIN_YEARS,
     WEATHER_DELTA,
+    YEAR_MAX,
+    YEAR_MIN,
     YIELD_DELTA,
 )
 from utils import get_spark, read_delta, try_mlflow_log, write_delta
